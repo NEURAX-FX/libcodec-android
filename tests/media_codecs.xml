@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MediaCodecs>
+  <Decoders>
+    <MediaCodec name="unrelated.prefix.hardware" type="video/avc"/>
+    <MediaCodec name="c2.mtk.software" type="video/avc">
+      <Attribute name="software-codec"/>
+    </MediaCodec>
+    <MediaCodec name="vendor.mixed">
+      <Type name="video/avc">
+        <Feature name="secure-playback" required="true"/>
+      </Type>
+      <Type name="video/hevc">
+        <Feature name="secure-playback" required="false"/>
+      </Type>
+    </MediaCodec>
+    <MediaCodec name="vendor.disabled" type="video/hevc" enabled="false"/>
+    <MediaCodec name="vendor.dual" type="video/avc">
+      <Type name="video/hevc">
+        <Feature name="secure-playback" optional="true"/>
+      </Type>
+    </MediaCodec>
+    <MediaCodec name="vendor.dual" type="video/avc" update="true">
+      <Type name="video/hevc" update="true">
+        <Feature name="secure-playback" value="1"/>
+      </Type>
+    </MediaCodec>
+    <MediaCodec name="vendor.value" type="video/avc">
+      <Feature name="secure-playback" value="1"/>
+    </MediaCodec>
+    <MediaCodec name="vendor.optional" type="video/avc">
+      <Feature name="secure-playback" optional="false"/>
+    </MediaCodec>
+    <MediaCodec name="vendor.enabled" type="video/avc" enabled="YES"/>
+  </Decoders>
+  <Encoders>
+    <MediaCodec name="vendor.encoder" type="video/avc"/>
+  </Encoders>
+</MediaCodecs>
