@@ -15,6 +15,7 @@ constexpr const char* intf_iface = "android.hardware.media.c2@1.0::IComponentInt
 constexpr const char* config_iface = "android.hardware.media.c2@1.0::IConfigurable";
 constexpr const char* listener_iface = "android.hardware.media.c2@1.0::IComponentListener";
 constexpr unsigned create_codes[] = {1, 9, 10};
+constexpr unsigned queue_code = 1;
 constexpr unsigned start_code = 10, stop_code = 11, release_code = 13, interface_code = 14;
 constexpr unsigned configurable_code = 1, query_code = 3, config_code = 4, describe_code = 5;
 constexpr unsigned work_done = 1, tripped = 2, error = 3, rendered = 4, input_released = 5;
@@ -53,8 +54,8 @@ std::vector<Param> read_params(Parcel& parcel) {
 
 } // namespace
 
-Component::Component(const Store& store, const std::string& name)
-    : listener_(gbinder_servicemanager_new_local_object(
+Component::Component(const Store& store, const std::string& name, WorkDone consumer)
+    : consumer_(std::move(consumer)), listener_(gbinder_servicemanager_new_local_object(
           store.manager(), listener_iface, callback, this)) {
     if (!listener_) throw std::runtime_error("cannot construct IComponentListener");
     const auto version = store.version();
@@ -205,6 +206,19 @@ void Component::start() {
     check();
 }
 
+void Component::queue(const InputWork& input) {
+    check();
+    if (state_ != State::running || !consumer_) throw std::logic_error("queue requires a running component with a listener");
+    constexpr auto method = "IComponent::queue";
+    auto reply = call(object_.get(), component_iface, queue_code, method,
+                      [&](GBinderWriter& writer) { write_work(writer, input); });
+    Parcel parcel(reply.get());
+    parcel.status(method);
+    check_status(parcel.i32(), method);
+    parcel.end();
+    check();
+}
+
 void Component::stop() {
     if (state_ != State::running) throw std::logic_error("stop requires a running component");
     const auto status = operation(stop_code, "IComponent::stop");
@@ -252,8 +266,8 @@ GBinderLocalReply* Component::callback(GBinderLocalObject*, GBinderRemoteRequest
                                      std::to_string(codec_status) + ", detail " + std::to_string(detail));
         }
         if (code == tripped) throw std::runtime_error("IComponentListener::onTripped: configuration conflict");
-        // Lifecycle testing queues no work and sets no surface; no frame
-        // consumer is installed. Still acknowledge the known one-way events.
+        if (self.callback_error_) return nullptr;
+        if (code == work_done && self.consumer_) read_work_done(parcel, self.consumer_);
         if (code == work_done || code == input_released || code == rendered) *status = GBINDER_STATUS_OK;
     } catch (...) {
         if (!self.callback_error_) self.callback_error_ = std::current_exception();
@@ -286,6 +300,23 @@ PictureSize configure_size(Component& component, PictureSize requested) {
         }
     }
     throw std::runtime_error("query: raw.size missing from component configuration");
+}
+
+void configure_readback(Component& component, PictureSize size) {
+    const auto actual = configure_size(component, size);
+    if (actual.width != size.width || actual.height != size.height) {
+        throw std::runtime_error("HAL did not accept requested raw.size");
+    }
+    constexpr uint32_t output_pools = 0x5001081a, output_usage = 0x5200081c, output_pixel = 0xd2001802;
+    constexpr uint64_t basic_graphic = 1;
+    const auto values = component.configure({make_param(output_pools, basic_graphic),
+                                            make_param(output_usage, uint64_t{1}), // CPU_READ
+                                            make_param(output_pixel, uint32_t{35})}); // YCBCR_420_888
+    for (const auto& param : values) {
+        if (param.index == output_pools && param.payload.size() == sizeof(basic_graphic) &&
+            param_value<uint64_t>(param) == basic_graphic) return;
+    }
+    throw std::runtime_error("HAL did not accept the BASIC_GRAPHIC output pool");
 }
 
 } // namespace c2

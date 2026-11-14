@@ -1,0 +1,6 @@
+id=mtk_codec2_droidspaces
+name=MTK Codec2 for DroidSpaces
+version=v1.1.0
+versionCode=2
+author=libcodec2-gbinder
+description=Allows MediaTek Codec2 Binder callbacks, reference transfer, and input buffer FD use with DroidSpaces without changing SELinux enforcement.

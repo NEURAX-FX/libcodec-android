@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "params.hpp"
+#include "work.hpp"
 #include "store.hpp"
 
 #include <exception>
@@ -18,7 +18,7 @@ struct ParamDescriptor {
 // context; the Store/device must remain alive for the life of the component.
 class Component {
 public:
-    Component(const Store& store, const std::string& name);
+    Component(const Store& store, const std::string& name, WorkDone consumer = {});
     ~Component();
     Component(const Component&) = delete;
     Component& operator=(const Component&) = delete;
@@ -27,6 +27,7 @@ public:
     std::vector<Param> query(const std::vector<uint32_t>& indices) const;
     std::vector<Param> configure(const std::vector<Param>& params);
     void start();
+    void queue(const InputWork& input);
     void stop();
     void release();
     void check() const;
@@ -40,6 +41,7 @@ private:
     void cleanup() noexcept;
 
     std::exception_ptr callback_error_;
+    WorkDone consumer_;
     Ref<GBinderLocalObject, gbinder_local_object_drop> listener_;
     Remote object_;
     Remote configurable_;
@@ -49,5 +51,6 @@ private:
 const Traits& choose_decoder(const std::vector<Traits>& traits, std::string_view mime,
                              std::string_view requested = {});
 PictureSize configure_size(Component& component, PictureSize requested);
+void configure_readback(Component& component, PictureSize size);
 
 } // namespace c2

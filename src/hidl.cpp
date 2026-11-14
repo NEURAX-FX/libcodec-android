@@ -109,6 +109,51 @@ std::string_view Parcel::string(const Buffer& parent, size_t offset) {
     return {text, header.len};
 }
 
+int Parcel::Handle::fd(size_t i) const {
+    if (i >= fd_count) malformed();
+    const int value = data.at<int>(sizeof(GBinderFds) + i * sizeof(int));
+    if (value < 0) malformed();
+    return value;
+}
+
+uint32_t Parcel::Handle::word(size_t i) const {
+    if (i >= int_count) malformed();
+    return data.at<uint32_t>(sizeof(GBinderFds) + (fd_count + i) * sizeof(uint32_t));
+}
+
+Parcel::Handle Parcel::handle(const Buffer& parent, size_t offset) {
+    const auto size = u64();
+    if (size == 0) {
+        if (parent.at<uint64_t>(offset)) malformed();
+        return {};
+    }
+    constexpr size_t max_fields = 1024; // native_handle_t limits per field
+    if (size < sizeof(GBinderFds) || size > sizeof(GBinderFds) + 2 * max_fields * sizeof(int)) {
+        malformed();
+    }
+    const auto contents = child(parent, offset, size);
+    const auto header = contents.at<GBinderFds>();
+    if (header.version != GBINDER_HIDL_FDS_VERSION || header.num_fds > max_fields ||
+        header.num_ints > max_fields ||
+        size != sizeof(header) + (header.num_fds + header.num_ints) * sizeof(int)) malformed();
+    const auto fda = peek<binder_fd_array_object>();
+    if (fda.hdr.type != BINDER_TYPE_FDA || fda.num_fds != header.num_fds ||
+        fda.parent != contents.index || fda.parent_offset != sizeof(GBinderFds)) malformed();
+
+    // libgbinder 1.1.x writes FD arrays but has no reader for them. Advance
+    // its object cursor only after checking the current byte cursor (slot 2),
+    // end (slot 1) and driver's object entry (slot 4). Byte reads alone
+    // would leave the object cursor behind and break all later child reads.
+    const auto* cursor = data_ + bytes_ - gbinder_reader_bytes_remaining(&reader_);
+    if (reader_.d[2] != cursor || reader_.d[1] != data_ + bytes_ || !reader_.d[4]) malformed();
+    const auto* objects = static_cast<const void* const*>(reader_.d[4]);
+    if (*objects != cursor) malformed();
+    for (size_t i = 0; i < sizeof(fda) / sizeof(uint32_t); ++i) u32();
+    reader_.d[4] = objects + 1;
+    ++index_;
+    return {contents, header.num_fds, header.num_ints};
+}
+
 GBinderRemoteObject* Parcel::object() {
     const auto flat = peek<flat_binder_object>();
     GBinderRemoteObject* object = nullptr;
@@ -131,6 +176,12 @@ uint32_t Parcel::u32() {
     guint32 value;
     if (!gbinder_reader_read_uint32(&reader_, &value)) malformed();
     return value;
+}
+
+uint64_t Parcel::u64() {
+    // Parcel primitives may be only four-byte aligned.
+    const uint64_t low = u32();
+    return low | (static_cast<uint64_t>(u32()) << 32);
 }
 
 void Parcel::status(std::string_view method) {

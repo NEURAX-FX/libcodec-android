@@ -84,7 +84,7 @@ std::vector<Traits> Store::list() const {
 
 bool hardware_video_decoder(const Traits& trait) {
     return trait.domain == Domain::video && trait.kind == Kind::decoder &&
-           (trait.mime == "video/avc" || trait.mime == "video/hevc") &&
+           (trait.mime == "video/avc" || trait.mime == "video/hevc" || trait.mime == "video/av01") &&
            trait.acceleration == Acceleration::hardware && !trait.disabled;
 }
 

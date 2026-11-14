@@ -40,6 +40,13 @@ public:
         size_t index;
         size_t offset;
     };
+    struct Handle {
+        Buffer data;
+        uint32_t fd_count = 0, int_count = 0;
+        int fd(size_t i) const;
+        uint32_t word(size_t i) const;
+        explicit operator bool() const { return data.data != nullptr; }
+    };
 
     explicit Parcel(GBinderRemoteReply* reply);
     explicit Parcel(GBinderRemoteRequest* request);
@@ -48,10 +55,12 @@ public:
     Buffer vector(size_t element_size, size_t& count);
     Buffer vector(const Buffer& parent, size_t offset, size_t element_size, size_t& count);
     std::string_view string(const Buffer& parent, size_t offset);
+    Handle handle(const Buffer& parent, size_t offset);
     GBinderRemoteObject* object(); // owned; may be null
     int32_t i32();
     uint32_t u32();
     void status(std::string_view method);
+    uint64_t u64();
     void end() const;
 
 private:

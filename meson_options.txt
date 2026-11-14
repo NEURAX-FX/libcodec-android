@@ -1,0 +1,2 @@
+option('amf_sdk', type: 'string', value: '',
+  description: 'Absolute include directory containing AMF/core/Factory.h; empty disables the AMF bridge')
