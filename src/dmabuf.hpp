@@ -20,9 +20,12 @@ private:
     int fd_;
 };
 
+enum class CpuAccess { read, write, read_write };
+
 class CpuView {
 public:
     CpuView(int fd, size_t size, bool write);
+    CpuView(int fd, size_t size, CpuAccess access);
     ~CpuView();
     CpuView(const CpuView&) = delete;
     CpuView& operator=(const CpuView&) = delete;
@@ -38,6 +41,8 @@ private:
 
 Fd duplicate_fd(int fd);
 Fd open_dma_heap(const char* path);
+// Allocate without mapping or filling; return the page-aligned extent in capacity.
+Fd allocate_dma_buffer(int heap, size_t length, uint32_t& capacity);
 Fd upload_packet(int heap, size_t length, uint32_t& capacity, const std::function<void(uint8_t*)>& fill);
 
 } // namespace c2

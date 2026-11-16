@@ -28,6 +28,7 @@ HAL 的 `ComponentTraits` 没有 `isHardwareAccelerated` 字段。分类使用 A
 | `c2-create` | **真机通过（临时授权）**。宿主全局为 `Enforcing`，`c2.mtk.avc.decoder` 返回 68 个支持参数，成功配置并回读 `128×96`，完成启动、停止和释放。 |
 | `c2-decode` | **普通 Fedora 容器真机通过**。H.264、HEVC、AV1 均与参考逐字节一致；AV1 验证了 MP4、Matroska、IVF 和低开销 OBU。 |
 | `codec2_drv_video.so` | **普通 Fedora 容器真机通过**。X11、Wayland、DRM 均可初始化。FFmpeg 强制 VA-API 解码 H.264 High 和 HEVC Main，各 29 帧（`162×106`，含 B 帧），直接映射 DRM PRIME 后读回与参考逐字节一致。 |
+| VA-API `EncSlice` | **普通 Fedora 容器真机通过**。原版 FFmpeg 与 GStreamer 均通过 MTK V4L2 编码 H.264 High／HEVC Main 并写出 MP4。FFmpeg 两路各 25 帧、`318×254`，变帧率 PTS/DTS 与输入一致；另验证了 NV12 DMA-BUF 原样导入和编码。 |
 | `libamfrt64.so.1` | **普通 Fedora 容器真机通过**。原版 FFmpeg 9.0.2 的 `av1_amf` 直连 MTK Codec2。两组各 40 帧，含仅在 `av1C` 中提供序列头的 MP4；I420 像素哈希、时间戳和帧时长均与 dav1d 一致。 |
 
 ### MTK Codec2 授权（ReSukiSU）
@@ -115,9 +116,9 @@ sh tests/mtk-vaapi.sh ./build /dev/dri/renderD128
 
 驱动将 VA 参数和完整切片组装为 Annex B，由 `c2.mtk.avc.decoder` 或 `c2.mtk.hevc.decoder` 解码。内部参数集请求 HAL 按解码顺序返回图片，保留原切片的 POC；按 Codec2 work index 匹配 `VASurfaceID`，显示顺序仍由 FFmpeg 管理。`hwdownload` 要求硬件帧，不能把软件回退误当成通过。
 
-VA 后端限逐行 8-bit 4:2:0，从 IDR 开始：H.264 Constrained Baseline／Main／High（POC 0/2），以及 HEVC Main（单层、temporal ID 0、切片内短期参考集；不支持 SPS RPS 模板、长期参考或 Main 10）。
+VA 解码限逐行 8-bit 4:2:0，从 IDR 开始：H.264 Constrained Baseline／Main／High（POC 0/2），以及 HEVC Main（单层、temporal ID 0、切片内短期参考集；不支持 SPS RPS 模板、长期参考或 Main 10）。
 
-不通过 VA-API 声明 AV1。原版 [FFmpeg 的 AV1 VA 后端](https://github.com/FFmpeg/FFmpeg/blob/n8.0/libavcodec/vaapi_av1.c) 提交图片参数和 tile 数据，不提供 Codec2 整码流解码所需的原始 OBU 帧头及完整参考刷新信息。AV1 走 `c2-decode` 或 `av1_amf` 的原始码流路径；驱动无编码入口。
+VA-API 不声明 AV1 编解码。原版 [FFmpeg 的 AV1 VA 后端](https://github.com/FFmpeg/FFmpeg/blob/n8.0/libavcodec/vaapi_av1.c) 提交图片参数和 tile 数据，不提供 Codec2 整码流解码所需的原始 OBU 帧头及完整参考刷新信息。AV1 解码走 `c2-decode` 或 `av1_amf` 的原始码流路径；设备没有暴露 AV1 硬编接口。
 
 #### DRM PRIME 零拷贝交付
 
@@ -126,6 +127,26 @@ VA 后端限逐行 8-bit 4:2:0，从 IDR 开始：H.264 Constrained Baseline／M
 FFmpeg 可在上面的命令中加 `-init_hw_device drm=prime:/dev/dri/renderD128 -filter_hw_device prime`，并把过滤链换成 `hwmap=mode=read+direct,format=drm_prime`，把帧交给支持 DRM PRIME 的下游。如需只读 CPU 像素，在后面接 `,hwmap=mode=read+direct,format=yuv420p` 可直接映射该 DMA-BUF，不必先 `hwdownload`；写文件或软件编码仍会读取像素。
 
 `tests/mtk-vaapi.sh` 验证直接映射和原有下载路径都与参考逐字节一致；同时把 29 个帧的 FD 导入 `vgem`，核对导回的是同一 DMA-BUF，并在继续解码及销毁 VA 解码器后复查像素。这个测试验证 DRM 导入与 FD 生命周期，不等同于播放器或显示设备的零拷贝验收。
+
+#### H.264／HEVC 硬编码
+
+同一个 VA-API 驱动在找到可访问的 `mtk-vcodec-enc` 节点（本机 `/dev/video4`）后声明 `VAEntrypointEncSlice`。编码绕过 Android Codec2，直接用 [Linux V4L2 有状态编码接口](https://docs.kernel.org/userspace-api/media/v4l/dev-encoder.html)；HEVC 优先使用 MTK 的 `H265` FourCC。`vgem` 只用于加载 VA-API 驱动。
+
+```sh
+# H.264；HEVC 把 h264_vaapi 换成 hevc_vaapi
+LIBVA_DRIVER_NAME=codec2 LIBVA_DRIVERS_PATH="$(realpath build)" \
+  ffmpeg -xerror -init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va \
+  -i input.mp4 -map 0:v:0 -vf 'format=nv12,hwupload' -fps_mode passthrough \
+  -c:v h264_vaapi output.mp4
+```
+
+MT6989 上不设码率时，FFmpeg 自动选 CQP（固定量化参数）；无需 `-rc_mode`、`-b:v` 或 `-bf 0`。要指定码率，例如加 `-rc_mode CBR -b:v 4M`。驱动按 V4L2 节点和编码格式探测模式，只有具备相应 QP 控件才报告 CQP。`sh tests/mtk-vaapi-encode.sh build` 验证默认协商，并从 H.264／HEVC 码流核对指定的 slice QP。
+
+GStreamer 的 `vah264enc`／`vah265enc` 也可用；运行时设置 `GST_VA_ALL_DRIVERS=1`，让 `va` 插件接受非 Mesa／Intel 驱动。驱动升级后若元素仍不可见，用独立的 `GST_REGISTRY_1_0` 路径重新探测。测试管线为 `videotestsrc ! video/x-raw,format=NV12,width=640,height=360,framerate=30/1 ! vah264enc rate-control=cbr bitrate=1200 b-frames=0 ! h264parse ! mp4mux ! filesink location=output.mp4`。
+
+- 编码支持固定尺寸的逐行 8-bit 4:2:0、CQP／CBR／VBR、单 slice、闭合 GOP 的 I/P 帧；没有 B 帧。`vaEndPicture` 等待原始帧释放并返回对应码流，不依赖客户端为 V4L2 单独发送 EOS。
+- VPS/SPS/PPS 由硬件生成，随第一帧交付，不支持 packed headers。普通 MP4 实测可以从首包取得配置；不保证需要在首帧之前就有 extradata 的封装方式。
+- 编码面支持可写 PRIME 2 导出，以及线性单对象 NV12／I420／YV12 导入。平面偏移和 stride 与 V4L2 协商一致时直接提交同一个 FD；不一致时复制到对齐的输入缓冲。CPU `hwupload` 仍需把像素写入 DMA-BUF；已解码面的导出仍限只读。
 
 ## ABI 与许可证
 

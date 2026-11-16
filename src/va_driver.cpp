@@ -2,6 +2,7 @@
 #include "component.hpp"
 #include "dmabuf.hpp"
 #include "frame.hpp"
+#include "va_encode.hpp"
 #include "va_h264.hpp"
 #include "va_hevc.hpp"
 
@@ -24,6 +25,11 @@ namespace {
 constexpr VAProfile profiles[] = {VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High,
                                   VAProfileHEVCMain};
 constexpr VAImageFormat i420{VA_FOURCC_I420, VA_LSB_FIRST, 12, 0, 0, 0, 0, 0, {}};
+constexpr VAImageFormat image_formats[] = {i420,
+    {VA_FOURCC_NV12, VA_LSB_FIRST, 12, 0, 0, 0, 0, 0, {}},
+    {VA_FOURCC_YV12, VA_LSB_FIRST, 12, 0, 0, 0, 0, 0, {}}};
+constexpr unsigned enc_min_width = 160, enc_min_height = 128;
+constexpr unsigned max_config_attributes = 8;
 constexpr unsigned min_dim = 64, max_width = 4096, max_height = 2304;
 constexpr size_t max_au = 64 * 1024 * 1024, max_slices = 4096;
 constexpr uint64_t sync_limit_ns = 8'000'000'000;
@@ -31,6 +37,11 @@ constexpr uint8_t start_code[] = {0, 0, 0, 1};
 
 struct Status { VAStatus code; };
 void require(bool ok, VAStatus code) { if (!ok) throw Status{code}; }
+
+class EncodingFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 template<class Map> auto& get(Map& map, VAGenericID id, VAStatus code) {
     const auto it = map.find(id);
@@ -47,15 +58,16 @@ bool valid_size(unsigned w, unsigned h) {
 }
 
 bool same_size(PictureSize a, PictureSize b) { return a.width == b.width && a.height == b.height; }
-size_t bytes_i420(PictureSize s) { return size_t(s.width) * s.height * 3 / 2; }
+struct Config {
+    VAProfile profile;
+    VAEntrypoint entry;
+    unsigned rate = VA_RC_VBR;
+    bool encode() const { return entry == VAEntrypointEncSlice; }
+};
 
-void copy_rows(uint8_t* dst, size_t dst_pitch, const uint8_t* src, size_t src_pitch,
-               size_t width, size_t height) {
-    if (width == dst_pitch && width == src_pitch) {
-        std::memcpy(dst, src, width * height);
-    } else {
-        for (size_t y = 0; y < height; ++y) std::memcpy(dst + y * dst_pitch, src + y * src_pitch, width);
-    }
+const VAImageFormat& image_format(unsigned fourcc) {
+    for (const auto& f : image_formats) if (f.fourcc == fourcc) return f;
+    throw Status{VA_STATUS_ERROR_INVALID_IMAGE_FORMAT};
 }
 
 struct Buffer {
@@ -64,6 +76,9 @@ struct Buffer {
     unsigned size, count;
     std::vector<uint8_t> data;
     bool mapped = false;
+    std::shared_ptr<EncodeSurface> raw;
+    std::unique_ptr<CpuView> mapping;
+    VACodedBufferSegment coded{};
 };
 using Buf = std::shared_ptr<Buffer>;
 
@@ -126,17 +141,59 @@ struct Surface {
     State state = State::idle;
     VAContextID owner = VA_INVALID_ID;
     std::optional<I420Buffer> frame;
+    uint32_t fourcc = VA_FOURCC_I420;
+    bool decode_only = false;
+    bool encode_hint = false;
+    std::shared_ptr<EncodeSurface> raw;
 };
 using Surfaces = std::unordered_map<VASurfaceID, Surface>;
 
+EncodeLayout decoded_pixels(const I420Layout& source) {
+    EncodeLayout out{source.size, VA_FOURCC_YV12, source.bytes, {}};
+    for (size_t i = 0; i < out.planes.size(); ++i) {
+        const auto& p = source.planes[i ? 3 - i : 0];
+        out.planes[i] = {p.offset, p.pitch};
+    }
+    return out;
+}
+
+EncodeLayout image_pixels(const VAImage& image) {
+    EncodeLayout layout{{image.width, image.height}, image.format.fourcc, image.data_size, {}};
+    for (unsigned i = 0; i < image.num_planes; ++i) layout.planes[i] = {image.offsets[i], image.pitches[i]};
+    return layout;
+}
+
+EncodeLayout pixel_region(EncodeLayout layout, int x, int y, unsigned w, unsigned h) {
+    require(x >= 0 && y >= 0 && w && h && !((w | h | x | y) & 1) &&
+            unsigned(x) <= layout.size.width && w <= layout.size.width - unsigned(x) &&
+            unsigned(y) <= layout.size.height && h <= layout.size.height - unsigned(y),
+            VA_STATUS_ERROR_INVALID_PARAMETER);
+    layout.size = {w, h};
+    for (unsigned i = 0; i < encode_planes(layout.fourcc); ++i) {
+        const auto sub = i != 0;
+        const auto chroma_x = sub && layout.fourcc != VA_FOURCC_NV12 ? 1 : 0;
+        layout.planes[i].offset += (unsigned(y) >> sub) * layout.planes[i].pitch + (unsigned(x) >> chroma_x);
+    }
+    return layout;
+}
+
+bool compatible_image_formats(uint32_t dst, uint32_t src) {
+    return dst == src || (encode_planes(dst) == 3 && encode_planes(src) == 3);
+}
+
 class Context {
 public:
-    Context(VAContextID id, VAProfile profile, PictureSize size, Surfaces& surfaces)
-        : id(id), profile(profile), size(size), surfaces_(surfaces) {}
+    Context(VAContextID id, Config config, PictureSize size, Surfaces& surfaces)
+        : id(id), profile(config.profile), size(size), surfaces_(surfaces) {
+        if (config.encode()) encoder.emplace(profile, config.rate);
+    }
     ~Context() {
         closing_ = true;
         component_.reset();
-        if (target != VA_INVALID_ID) fail(target);
+        if (target != VA_INVALID_ID) {
+            if (encoder) surfaces_.at(target).state = source_state;
+            else fail(target);
+        }
         for (const auto& p : pending_) if (p.surface != VA_INVALID_ID) fail(p.surface);
     }
 
@@ -222,6 +279,8 @@ public:
     const PictureSize size;
     VASurfaceID target = VA_INVALID_ID;
     std::vector<Buf> submitted;
+    std::optional<VaEncoder> encoder;
+    State source_state = State::idle;
 
 private:
     struct Pending { uint64_t index = 0; VASurfaceID surface = VA_INVALID_ID; };
@@ -278,6 +337,12 @@ private:
 
 class Driver {
 public:
+    const EncodeRates rates = v4l2_encode_rates();
+
+    bool can_encode(VAProfile profile) const {
+        const auto i = static_cast<unsigned>(profile);
+        return i < rates.size() && rates[i];
+    }
     VAStatus query_profiles(VAProfile* out, int* count) {
         require(out && count, VA_STATUS_ERROR_INVALID_PARAMETER);
         std::copy(std::begin(profiles), std::end(profiles), out);
@@ -290,25 +355,39 @@ public:
         require(out && count, VA_STATUS_ERROR_INVALID_PARAMETER);
         *out = VAEntrypointVLD;
         *count = 1;
+        if (can_encode(profile)) out[(*count)++] = VAEntrypointEncSlice;
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus get_config_attributes(VAProfile profile, VAEntrypoint entry, VAConfigAttrib* a, int n) {
         check_profile(profile, entry);
         require(n >= 0 && (!n || a), VA_STATUS_ERROR_INVALID_PARAMETER);
-        for (int i = 0; i < n; ++i) a[i].value = config_value(a[i].type);
+        for (int i = 0; i < n; ++i) a[i].value = config_value(profile, entry, a[i].type);
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus create_config(VAProfile profile, VAEntrypoint entry, VAConfigAttrib* a, int n, VAConfigID* out) {
         check_profile(profile, entry);
         require(out && n >= 0 && (!n || a), VA_STATUS_ERROR_INVALID_PARAMETER);
+        Config config{profile, entry};
+        if (config.encode()) {
+            const auto mask = rates[profile];
+            config.rate = mask & VA_RC_VBR ? VA_RC_VBR : mask & VA_RC_CBR ? VA_RC_CBR : VA_RC_CQP;
+        }
         for (int i = 0; i < n; ++i) {
-            require((a[i].type == VAConfigAttribRTFormat || a[i].type == VAConfigAttribDecSliceMode) &&
-                    a[i].value == config_value(a[i].type), VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+            if (config.encode() && a[i].type == VAConfigAttribRateControl) {
+                const auto mode = a[i].value;
+                require((mode & rates[profile]) && !(mode & (mode - 1)), VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+                config.rate = a[i].value;
+            } else {
+                const auto type = a[i].type;
+                const bool configurable = type == VAConfigAttribRTFormat ||
+                    type == (config.encode() ? VAConfigAttribEncPackedHeaders : VAConfigAttribDecSliceMode);
+                require(configurable && a[i].value == config_value(profile, entry, type), VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+            }
         }
         const auto id = allocate_id();
-        configs_.emplace(id, profile);
+        configs_.emplace(id, config);
         *out = id;
         return VA_STATUS_SUCCESS;
     }
@@ -320,36 +399,41 @@ public:
 
     VAStatus query_config(VAConfigID id, VAProfile* profile, VAEntrypoint* entry, VAConfigAttrib* a, int* n) {
         require(profile && entry && a && n, VA_STATUS_ERROR_INVALID_PARAMETER);
-        *profile = get(configs_, id, VA_STATUS_ERROR_INVALID_CONFIG);
-        *entry = VAEntrypointVLD;
+        const auto& config = get(configs_, id, VA_STATUS_ERROR_INVALID_CONFIG);
+        *profile = config.profile;
+        *entry = config.entry;
         a[0] = {VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420};
-        a[1] = {VAConfigAttribDecSliceMode, VA_DEC_SLICE_MODE_NORMAL};
+        a[1] = config.encode() ? VAConfigAttrib{VAConfigAttribRateControl, config.rate}
+                               : VAConfigAttrib{VAConfigAttribDecSliceMode, VA_DEC_SLICE_MODE_NORMAL};
         *n = 2;
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus query_surface_attributes(VAConfigID id, VASurfaceAttrib* a, unsigned* n) {
-        get(configs_, id, VA_STATUS_ERROR_INVALID_CONFIG);
+        const auto& config = get(configs_, id, VA_STATUS_ERROR_INVALID_CONFIG);
         require(n, VA_STATUS_ERROR_INVALID_PARAMETER);
-        constexpr unsigned gettable = VA_SURFACE_ATTRIB_GETTABLE;
-        constexpr unsigned both = gettable | VA_SURFACE_ATTRIB_SETTABLE;
-        constexpr std::pair<VASurfaceAttribType, int> values[] = {
-            {VASurfaceAttribPixelFormat, VA_FOURCC_I420}, {VASurfaceAttribMemoryType, VA_SURFACE_ATTRIB_MEM_TYPE_VA},
-            {VASurfaceAttribMinWidth, min_dim}, {VASurfaceAttribMinHeight, min_dim},
-            {VASurfaceAttribMaxWidth, max_width}, {VASurfaceAttribMaxHeight, max_height},
-        };
-        if (a && *n < std::size(values)) {
-            *n = std::size(values);
+        const bool encode = config.encode();
+        const unsigned count = encode ? 8 : 6;
+        if (a && *n < count) {
+            *n = count;
             return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
         }
-        *n = std::size(values);
-        if (a) for (unsigned i = 0; i < *n; ++i) {
-            a[i] = {};
-            a[i].type = values[i].first;
-            a[i].flags = i < 2 ? both : gettable;
-            a[i].value.type = VAGenericValueTypeInteger;
-            a[i].value.value.i = values[i].second;
-        }
+        *n = count;
+        if (!a) return VA_STATUS_SUCCESS;
+        const auto push = [&](VASurfaceAttribType type, int value, bool writable = false) {
+            *a = {type, VA_SURFACE_ATTRIB_GETTABLE | (writable ? VA_SURFACE_ATTRIB_SETTABLE : 0u),
+                  {VAGenericValueTypeInteger, {value}}};
+            ++a;
+        };
+        if (encode) push(VASurfaceAttribPixelFormat, VA_FOURCC_NV12, true);
+        push(VASurfaceAttribPixelFormat, VA_FOURCC_I420, true);
+        if (encode) push(VASurfaceAttribPixelFormat, VA_FOURCC_YV12, true);
+        push(VASurfaceAttribMemoryType,
+             VA_SURFACE_ATTRIB_MEM_TYPE_VA | (encode ? VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 : 0), true);
+        push(VASurfaceAttribMinWidth, encode ? enc_min_width : min_dim);
+        push(VASurfaceAttribMinHeight, encode ? enc_min_height : min_dim);
+        push(VASurfaceAttribMaxWidth, max_width);
+        push(VASurfaceAttribMaxHeight, max_height);
         return VA_STATUS_SUCCESS;
     }
 
@@ -362,27 +446,50 @@ public:
         require(format == VA_RT_FORMAT_YUV420, VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
         require(valid_size(w, h), VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
         require(out && n && n <= 128 && (!na || a), VA_STATUS_ERROR_INVALID_PARAMETER);
+        unsigned memory = VA_SURFACE_ATTRIB_MEM_TYPE_VA, fourcc = 0, usage = 0;
+        const VADRMPRIMESurfaceDescriptor* external = nullptr;
         for (unsigned i = 0; i < na; ++i) {
+            if (a[i].type == VASurfaceAttribExternalBufferDescriptor) {
+                require(a[i].value.type == VAGenericValueTypePointer && a[i].value.value.p && !external,
+                        VA_STATUS_ERROR_INVALID_PARAMETER);
+                external = static_cast<const VADRMPRIMESurfaceDescriptor*>(a[i].value.value.p);
+                continue;
+            }
             require(a[i].value.type == VAGenericValueTypeInteger, VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
             const auto value = static_cast<unsigned>(a[i].value.value.i);
             switch (a[i].type) {
             case VASurfaceAttribPixelFormat:
-                require(value == VA_FOURCC_I420, VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+                require(encode_pixel_format(value), VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+                fourcc = value;
                 break;
             case VASurfaceAttribMemoryType:
-                require(value == VA_SURFACE_ATTRIB_MEM_TYPE_VA, VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+                require(value == VA_SURFACE_ATTRIB_MEM_TYPE_VA || value == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                        VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+                memory = value;
                 break;
             case VASurfaceAttribUsageHint:
-                require(!(value & ~VA_SURFACE_ATTRIB_USAGE_HINT_DECODER), VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
+                usage = value;
                 break;
             default: throw Status{VA_STATUS_ERROR_ATTR_NOT_SUPPORTED};
             }
         }
+        const bool imported = memory == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+        require(imported == bool(external), VA_STATUS_ERROR_INVALID_PARAMETER);
+        const bool encode_hint = usage & VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER;
+        const bool decode_only = (usage & VA_SURFACE_ATTRIB_USAGE_HINT_DECODER) && !encode_hint;
+        require(!imported || !decode_only, VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
         unsigned i = 0;
         try {
             for (; i < n; ++i) {
+                auto pixel = fourcc ? fourcc : VA_FOURCC_I420;
+                std::shared_ptr<EncodeSurface> raw;
+                if (imported) {
+                    raw = std::make_shared<EncodeSurface>(import_encode_surface({w, h}, fourcc, external[i]));
+                    pixel = raw->layout.fourcc;
+                }
                 const auto id = allocate_id();
-                surfaces_.emplace(id, Surface{{w, h}, State::idle, VA_INVALID_ID, {}});
+                surfaces_.emplace(id, Surface{{w, h}, State::idle, VA_INVALID_ID, {}, pixel, decode_only,
+                                             encode_hint, std::move(raw)});
                 out[i] = id;
             }
         } catch (...) {
@@ -392,11 +499,14 @@ public:
         return VA_STATUS_SUCCESS;
     }
 
+    bool uses_codec2() const { return decode_contexts_ != 0; }
+
     VAStatus destroy_surfaces(VASurfaceID* ids, int n) {
         require(n >= 0 && (!n || ids), VA_STATUS_ERROR_INVALID_PARAMETER);
         for (int i = 0; i < n; ++i) {
             auto& s = surface(ids[i]);
             require(s.state != State::collecting && s.state != State::queued, VA_STATUS_ERROR_SURFACE_BUSY);
+            require(s.raw.use_count() <= 1, VA_STATUS_ERROR_SURFACE_BUSY);
         }
         for (int i = 0; i < n; ++i) surfaces_.erase(ids[i]);
         return VA_STATUS_SUCCESS;
@@ -404,21 +514,23 @@ public:
 
     VAStatus create_context(VAConfigID config, int w, int h, int flag, VASurfaceID* targets, int n,
                             VAContextID* out) {
-        const auto profile = get(configs_, config, VA_STATUS_ERROR_INVALID_CONFIG);
+        const auto cfg = get(configs_, config, VA_STATUS_ERROR_INVALID_CONFIG);
         require(flag == VA_PROGRESSIVE, VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
-        require(valid_size(w, h) && (profile == VAProfileHEVCMain || !((w | h) & 15)),
-                VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+        require(valid_size(w, h) && (cfg.encode() ? (unsigned(w) >= enc_min_width && unsigned(h) >= enc_min_height) :
+                (cfg.profile == VAProfileHEVCMain || !((w | h) & 15))), VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
         require(out && n >= 0 && (!n || targets), VA_STATUS_ERROR_INVALID_PARAMETER);
         const PictureSize size{static_cast<unsigned>(w), static_cast<unsigned>(h)};
         for (int i = 0; i < n; ++i) require(same_size(surface(targets[i]).size, size), VA_STATUS_ERROR_INVALID_SURFACE);
         const auto id = allocate_id();
-        contexts_.try_emplace(id, id, profile, size, surfaces_);
+        contexts_.try_emplace(id, id, cfg, size, surfaces_);
+        if (!cfg.encode()) ++decode_contexts_;
         *out = id;
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus destroy_context(VAContextID id) {
-        require(contexts_.erase(id), VA_STATUS_ERROR_INVALID_CONTEXT);
+        if (!context(id).encoder) --decode_contexts_;
+        contexts_.erase(id);
         for (auto it = buffers_.begin(); it != buffers_.end();) {
             if (it->second->context == id) it = buffers_.erase(it);
             else ++it;
@@ -428,8 +540,15 @@ public:
 
     VAStatus create_buffer(VAContextID id, VABufferType type, unsigned size, unsigned count, void* data,
                            VABufferID* out) {
-        const bool hevc = context(id).profile == VAProfileHEVCMain;
+        const auto& c = context(id);
+        const bool hevc = c.profile == VAProfileHEVCMain;
         require(out && size && count && size <= max_au / count, VA_STATUS_ERROR_INVALID_PARAMETER);
+        if (c.encoder) {
+            require(encode_buffer_shape(c.profile, type, size, count), VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE);
+            require(type != VAEncCodedBufferType || !data, VA_STATUS_ERROR_INVALID_PARAMETER);
+            *out = add_buffer(id, type, size, count, data);
+            return VA_STATUS_SUCCESS;
+        }
         switch (type) {
         case VAPictureParameterBufferType:
             require(size == (hevc ? sizeof(VAPictureParameterBufferHEVC) : sizeof(VAPictureParameterBufferH264)) &&
@@ -468,11 +587,30 @@ public:
         return VA_STATUS_SUCCESS;
     }
 
-    VAStatus map_buffer(VABufferID id, void** out) {
+    VAStatus map_buffer(VABufferID id, void** out) { return map_buffer_access(id, out, 0); }
+
+    VAStatus map_buffer_access(VABufferID id, void** out, uint32_t flags) {
+        constexpr uint32_t read = 1, write = 2; // VA_MAPBUFFER_FLAG_READ/WRITE
         auto& b = buffer(id);
-        require(out, VA_STATUS_ERROR_INVALID_PARAMETER);
+        require(out && !(flags & ~(read | write)), VA_STATUS_ERROR_INVALID_PARAMETER);
         require(!b->mapped && b.use_count() == 1, VA_STATUS_ERROR_SURFACE_BUSY);
-        *out = b->data.data();
+        if (b->type == VAEncCodedBufferType) {
+            require(!(flags & write), VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
+            sync_buffer(id, 0);
+            b->coded.size = static_cast<uint32_t>(b->data.size());
+            b->coded.buf = b->data.data();
+            *out = &b->coded;
+        } else if (b->raw) {
+            const auto& pixels = *b->raw;
+            const auto access = flags == write ? CpuAccess::write : flags == read || (!flags && !pixels.writable)
+                ? CpuAccess::read : CpuAccess::read_write;
+            require(access == CpuAccess::read || pixels.writable, VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
+            wait_encode_input(pixels.fd.get());
+            b->mapping = std::make_unique<CpuView>(pixels.fd.get(), pixels.layout.bytes, access);
+            *out = b->mapping->data();
+        } else {
+            *out = b->data.data();
+        }
         b->mapped = true;
         return VA_STATUS_SUCCESS;
     }
@@ -481,6 +619,10 @@ public:
         auto& b = *buffer(id);
         require(b.mapped, VA_STATUS_ERROR_INVALID_BUFFER);
         b.mapped = false;
+        if (b.mapping) {
+            auto mapping = std::move(b.mapping);
+            mapping->finish();
+        }
         return VA_STATUS_SUCCESS;
     }
 
@@ -495,24 +637,33 @@ public:
         auto& c = context(id);
         auto& s = surface(target);
         c.check();
+        if (c.encoder && s.state == State::queued) sync(target);
         require(c.target == VA_INVALID_ID && s.state != State::collecting && s.state != State::queued,
                 VA_STATUS_ERROR_SURFACE_BUSY);
-        require(same_size(c.size, s.size), VA_STATUS_ERROR_INVALID_SURFACE);
-        s.frame.reset(); // previously exported FDs own their reference
+        if (c.encoder) {
+            require(s.state != State::failed && (s.raw || s.frame), VA_STATUS_ERROR_INVALID_SURFACE);
+            require(s.raw.use_count() <= 1, VA_STATUS_ERROR_SURFACE_BUSY);
+            c.source_state = s.state;
+        } else {
+            require(same_size(c.size, s.size) && s.fourcc == VA_FOURCC_I420 && !s.raw,
+                    VA_STATUS_ERROR_INVALID_SURFACE);
+            s.frame.reset(); // previously exported FDs own their reference
+            s.owner = id;
+        }
         c.target = target;
-        s.owner = id;
         s.state = State::collecting;
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus render(VAContextID id, VABufferID* ids, int n) {
         auto& c = context(id);
-        const size_t limit = 2 + 2 * max_slices;
+        const size_t limit = c.encoder ? 16 : 2 + 2 * max_slices;
         require(c.target != VA_INVALID_ID && n > 0 && ids && size_t(n) <= limit - c.submitted.size(),
                 VA_STATUS_ERROR_INVALID_PARAMETER);
         for (int i = 0; i < n; ++i) {
             const auto& b = *buffer(ids[i]);
             require(!b.mapped && b.context == id, VA_STATUS_ERROR_INVALID_BUFFER);
+            require(b.type != VAEncCodedBufferType, VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE);
         }
         c.submitted.reserve(c.submitted.size() + n);
         for (int i = 0; i < n; ++i) c.submitted.push_back(buffer(ids[i]));
@@ -523,6 +674,37 @@ public:
         auto& c = context(id);
         require(c.target != VA_INVALID_ID, VA_STATUS_ERROR_INVALID_CONTEXT);
         const auto target = std::exchange(c.target, VA_INVALID_ID);
+        if (c.encoder) {
+            auto& s = surface(target);
+            s.state = c.source_state; // this is an input, never a reconstructed picture
+            auto params = std::move(c.submitted);
+            c.submitted.clear();
+            auto picture = c.encoder->picture(s.size);
+            for (const auto& b : params) picture.add(b->type, b->data.data(), b->data.size());
+            picture.finish(c.size, !c.encoder->started());
+            if (picture.recon != VA_INVALID_ID) {
+                require(picture.recon != target && same_size(surface(picture.recon).size, c.size),
+                        VA_STATUS_ERROR_INVALID_SURFACE);
+            }
+            auto& b = *buffer(picture.coded);
+            require(b.type == VAEncCodedBufferType && b.context == id && !b.mapped, VA_STATUS_ERROR_INVALID_BUFFER);
+            const auto layout = s.frame ? decoded_pixels(s.frame->layout) : s.raw->layout;
+            const auto fd = s.frame ? s.frame->fd.get() : s.raw->fd.get();
+            b.data.clear();
+            try {
+                c.encoder->encode(picture, layout, fd, b.size, b.data);
+            } catch (const std::invalid_argument&) {
+                b.data.clear();
+                throw;
+            } catch (const std::bad_alloc&) {
+                b.data.clear();
+                throw;
+            } catch (const std::exception& e) {
+                b.data.clear();
+                throw EncodingFailure(e.what());
+            }
+            return VA_STATUS_SUCCESS;
+        }
         try {
             c.submit(target, c.submitted);
         } catch (...) {
@@ -532,6 +714,12 @@ public:
         }
         c.submitted.clear();
         return VA_STATUS_SUCCESS;
+    }
+
+    VAStatus sync_buffer(VABufferID id, uint64_t) {
+        const auto& b = *buffer(id);
+        require(b.type == VAEncCodedBufferType && !b.data.empty(), VA_STATUS_ERROR_INVALID_BUFFER);
+        return VA_STATUS_SUCCESS; // vaEndPicture waits for both queues to return the picture
     }
 
     VAStatus sync(VASurfaceID id) { return sync_timed(id, sync_limit_ns); }
@@ -568,11 +756,22 @@ public:
         require(out, VA_STATUS_ERROR_INVALID_PARAMETER);
         require(type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
         constexpr uint32_t layers = VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_COMPOSED_LAYERS;
-        require((flags & ~layers) == VA_EXPORT_SURFACE_READ_ONLY && (flags & layers) != layers,
+        constexpr uint32_t access = VA_EXPORT_SURFACE_READ_WRITE;
+        require((flags & access) && !(flags & ~(access | layers)) && (flags & layers) != layers,
                 VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
-        const auto& s = surface(id);
+        auto& s = surface(id);
         require(s.state != State::collecting && s.state != State::queued, VA_STATUS_ERROR_SURFACE_BUSY);
-        require(s.state == State::ready && s.frame, VA_STATUS_ERROR_INVALID_SURFACE);
+        require(s.state != State::failed, VA_STATUS_ERROR_INVALID_SURFACE);
+        if (!s.frame) {
+            require(!s.decode_only && (s.raw || (flags & VA_EXPORT_SURFACE_WRITE_ONLY)), VA_STATUS_ERROR_INVALID_SURFACE);
+            auto& pixels = raw_surface(s);
+            require(!(flags & VA_EXPORT_SURFACE_WRITE_ONLY) || pixels.writable, VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
+            require(s.raw.use_count() == 1, VA_STATUS_ERROR_SURFACE_BUSY);
+            *static_cast<VADRMPRIMESurfaceDescriptor*>(out) =
+                export_encode_surface(pixels, flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS);
+            return VA_STATUS_SUCCESS;
+        }
+        require((flags & access) == VA_EXPORT_SURFACE_READ_ONLY, VA_STATUS_ERROR_FLAG_NOT_SUPPORTED);
         const auto& frame = *s.frame;
         const auto& layout = frame.layout;
         const bool separate = flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS;
@@ -610,52 +809,75 @@ public:
 
     VAStatus query_image_formats(VAImageFormat* out, int* n) {
         require(out && n, VA_STATUS_ERROR_INVALID_PARAMETER);
-        *out = i420;
-        *n = 1;
+        std::copy(std::begin(image_formats), std::end(image_formats), out);
+        *n = std::size(image_formats);
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus create_image(VAImageFormat* format, int w, int h, VAImage* out) {
         require(format && out, VA_STATUS_ERROR_INVALID_PARAMETER);
-        require(format->fourcc == i420.fourcc, VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+        image_format(format->fourcc);
         require(valid_size(w, h), VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
-        const auto size = PictureSize{static_cast<unsigned>(w), static_cast<unsigned>(h)};
-        VAImage image{};
-        image.image_id = allocate_id();
-        image.format = i420;
-        image.width = w;
-        image.height = h;
-        image.data_size = bytes_i420(size);
-        image.num_planes = 3;
-        image.pitches[0] = w;
-        image.pitches[1] = image.pitches[2] = w / 2;
-        image.offsets[1] = w * h;
-        image.offsets[2] = image.offsets[1] * 5 / 4;
-        image.buf = add_buffer(VA_INVALID_ID, VAImageBufferType, image.data_size, 1, nullptr);
-        try { images_.emplace(image.image_id, image); }
-        catch (...) { buffers_.erase(image.buf); throw; }
-        *out = image;
+        const unsigned width = w, height = h;
+        const unsigned luma = width * height;
+        EncodeLayout layout{{width, height}, format->fourcc, luma * 3 / 2, {}};
+        layout.planes[0] = {0, width};
+        if (layout.fourcc == VA_FOURCC_NV12) layout.planes[1] = {luma, width};
+        else {
+            layout.planes[1] = {luma, width / 2};
+            layout.planes[2] = {luma * 5 / 4, width / 2};
+        }
+        *out = add_image(layout);
+        return VA_STATUS_SUCCESS;
+    }
+
+    VAStatus derive_image(VASurfaceID id, VAImage* out) {
+        auto& s = surface(id);
+        require(out, VA_STATUS_ERROR_INVALID_PARAMETER);
+        require(s.state == State::idle && !s.decode_only &&
+                (s.raw || s.encode_hint || s.fourcc != VA_FOURCC_I420), VA_STATUS_ERROR_OPERATION_FAILED);
+        const auto& raw = raw_surface(s);
+        require(s.raw.use_count() == 1, VA_STATUS_ERROR_SURFACE_BUSY);
+        *out = add_image(raw.layout, s.raw);
         return VA_STATUS_SUCCESS;
     }
 
     VAStatus get_image(VASurfaceID id, int x, int y, unsigned w, unsigned h, VAImageID image_id) {
         const auto& s = surface(id);
-        auto& image = get(images_, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
+        const auto& image = get(images_, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
         auto& b = *buffer(image.buf);
-        const auto sw = s.size.width, sh = s.size.height;
-        require(x >= 0 && y >= 0 && unsigned(x) <= sw && unsigned(y) <= sh && w <= sw - x && h <= sh - y &&
-                w == image.width && h == image.height && !((w | h | x | y) & 1), VA_STATUS_ERROR_INVALID_PARAMETER);
-        require(!b.mapped, VA_STATUS_ERROR_SURFACE_BUSY);
+        require(w == image.width && h == image.height, VA_STATUS_ERROR_INVALID_PARAMETER);
+        require(!b.mapped && !b.raw && s.raw.use_count() <= 1, VA_STATUS_ERROR_SURFACE_BUSY);
         sync(id);
-        require(s.state == State::ready && s.frame, VA_STATUS_ERROR_INVALID_SURFACE);
-        s.frame->layout.read(s.frame->fd.get(), [&](const I420View& view) {
-            for (size_t i = 0; i < view.planes.size(); ++i) {
-                const unsigned sub = i != 0;
-                const auto& p = view.planes[i];
-                copy_rows(b.data.data() + image.offsets[i], image.pitches[i],
-                          p.data + size_t(y >> sub) * p.stride + (x >> sub), p.stride, w >> sub, h >> sub);
-            }
-        });
+        require(s.frame || s.raw, VA_STATUS_ERROR_INVALID_SURFACE);
+        const auto source = s.frame ? decoded_pixels(s.frame->layout) : s.raw->layout;
+        auto cropped = pixel_region(source, x, y, w, h);
+        require(compatible_image_formats(image.format.fourcc, cropped.fourcc), VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+        const int fd = s.frame ? s.frame->fd.get() : s.raw->fd.get();
+        if (!s.frame) wait_encode_input(fd);
+        CpuView map(fd, source.bytes, false);
+        copy_encode_pixels(image_pixels(image), b.data.data(), cropped, map.data());
+        map.finish();
+        return VA_STATUS_SUCCESS;
+    }
+
+    VAStatus put_image(VASurfaceID id, VAImageID image_id, int sx, int sy, unsigned sw, unsigned sh,
+                       int dx, int dy, unsigned dw, unsigned dh) {
+        auto& s = surface(id);
+        const auto& image = get(images_, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
+        const auto& b = *buffer(image.buf);
+        require(sw == dw && sh == dh, VA_STATUS_ERROR_UNIMPLEMENTED);
+        require(!b.raw && !s.decode_only && s.state == State::idle, VA_STATUS_ERROR_INVALID_SURFACE);
+        require(!b.mapped && s.raw.use_count() <= 1, VA_STATUS_ERROR_SURFACE_BUSY);
+        auto src = pixel_region(image_pixels(image), sx, sy, sw, sh);
+        require(compatible_image_formats(s.fourcc, src.fourcc), VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+        auto& pixels = raw_surface(s);
+        require(pixels.writable, VA_STATUS_ERROR_INVALID_SURFACE);
+        auto dst = pixel_region(pixels.layout, dx, dy, dw, dh);
+        wait_encode_input(pixels.fd.get());
+        CpuView map(pixels.fd.get(), pixels.layout.bytes, true);
+        copy_encode_pixels(dst, map.data(), src, b.data.data());
+        map.finish();
         return VA_STATUS_SUCCESS;
     }
 
@@ -668,12 +890,17 @@ public:
     }
 
 private:
-    static void check_profile(VAProfile p, VAEntrypoint e) {
+    void check_profile(VAProfile p, VAEntrypoint e) const {
         require(supported(p), VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
-        require(e == VAEntrypointVLD, VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+        require(e == VAEntrypointVLD || (e == VAEntrypointEncSlice && can_encode(p)),
+                VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
     }
 
-    static unsigned config_value(VAConfigAttribType t) {
+    unsigned config_value(VAProfile profile, VAEntrypoint entry, VAConfigAttribType t) const {
+        if (entry == VAEntrypointEncSlice && t == VAConfigAttribRateControl) return rates[profile];
+        if (entry == VAEntrypointEncSlice && t != VAConfigAttribMaxPictureWidth && t != VAConfigAttribMaxPictureHeight) {
+            return encode_attribute(t);
+        }
         switch (t) {
         case VAConfigAttribRTFormat: return VA_RT_FORMAT_YUV420;
         case VAConfigAttribDecSliceMode: return VA_DEC_SLICE_MODE_NORMAL;
@@ -691,14 +918,47 @@ private:
     Surface& surface(VASurfaceID id) { return get(surfaces_, id, VA_STATUS_ERROR_INVALID_SURFACE); }
     Buf& buffer(VABufferID id) { return get(buffers_, id, VA_STATUS_ERROR_INVALID_BUFFER); }
 
-    VABufferID add_buffer(VAContextID context, VABufferType type, unsigned size, unsigned count, const void* data) {
+    EncodeSurface& raw_surface(Surface& s) {
+        if (!s.raw) {
+            if (heap_.get() < 0) heap_ = open_dma_heap("/dev/dma_heap/system");
+            s.raw = std::make_shared<EncodeSurface>(allocate_encode_surface(heap_.get(),
+                native_encode_layout(s.size, s.fourcc)));
+        }
+        return *s.raw;
+    }
+
+    VAImage add_image(const EncodeLayout& layout, std::shared_ptr<EncodeSurface> raw = {}) {
+        VAImage image{};
+        image.image_id = allocate_id();
+        image.format = image_format(layout.fourcc);
+        image.width = layout.size.width;
+        image.height = layout.size.height;
+        image.data_size = layout.bytes;
+        image.num_planes = encode_planes(layout.fourcc);
+        for (unsigned i = 0; i < image.num_planes; ++i) {
+            image.pitches[i] = layout.planes[i].pitch;
+            image.offsets[i] = layout.planes[i].offset;
+        }
+        image.buf = add_buffer(VA_INVALID_ID, VAImageBufferType, image.data_size, 1, nullptr, std::move(raw));
+        try { images_.emplace(image.image_id, image); }
+        catch (...) { buffers_.erase(image.buf); throw; }
+        return image;
+    }
+
+    VABufferID add_buffer(VAContextID context, VABufferType type, unsigned size, unsigned count,
+                          const void* data, std::shared_ptr<EncodeSurface> raw = {}) {
         const auto id = allocate_id();
         const size_t bytes = size_t(size) * count;
-        auto b = std::make_shared<Buffer>(Buffer{context, type, size, count, {}, false});
+        auto b = std::make_shared<Buffer>();
+        b->context = context;
+        b->type = type;
+        b->size = size;
+        b->count = count;
+        b->raw = std::move(raw);
         if (data) {
             const auto* src = static_cast<const uint8_t*>(data);
             b->data.assign(src, src + bytes);
-        } else {
+        } else if (!b->raw && type != VAEncCodedBufferType) {
             b->data.resize(bytes);
         }
         buffers_.emplace(id, std::move(b));
@@ -706,34 +966,38 @@ private:
     }
 
     VAGenericID next_id_ = 1;
-    std::unordered_map<VAConfigID, VAProfile> configs_;
+    size_t decode_contexts_ = 0;
+    Fd heap_;
+    std::unordered_map<VAConfigID, Config> configs_;
     Surfaces surfaces_; // must outlive Context destruction and callbacks
     std::unordered_map<VAContextID, Context> contexts_;
     std::unordered_map<VABufferID, Buf> buffers_;
     std::unordered_map<VAImageID, VAImage> images_;
 };
 
-// libgbinder delivers this client's callbacks on GLib's default context.
-// Serialize VA entry points, and own that context for the entire call.
+// Serialize access to driver state. Only a display with a Codec2 decode
+// context dispatches Binder callbacks on GLib's default context; a V4L2
+// encode display must also work while the application's main loop owns it.
 std::mutex va_lock;
 thread_local bool entered = false;
 
 class Dispatch {
 public:
     Dispatch() : lock_(va_lock, std::defer_lock) {
-        if (!entered) {
-            lock_.lock();
-            acquired_ = g_main_context_acquire(g_main_context_default());
-            entered = acquired_;
-        }
+        if (entered) return;
+        lock_.lock();
+        entered = true;
     }
     ~Dispatch() {
-        if (acquired_) {
-            entered = false;
-            g_main_context_release(g_main_context_default());
-        }
+        if (acquired_) g_main_context_release(g_main_context_default());
+        if (lock_.owns_lock()) entered = false;
     }
-    explicit operator bool() const { return acquired_; }
+    bool for_driver(const Driver& driver) {
+        if (!lock_.owns_lock()) return false;
+        if (!driver.uses_codec2()) return true;
+        acquired_ = g_main_context_acquire(g_main_context_default());
+        return acquired_;
+    }
 private:
     std::unique_lock<std::mutex> lock_;
     bool acquired_ = false;
@@ -743,14 +1007,20 @@ template<auto Method, class... Args>
 VAStatus hook(VADriverContextP ctx, Args... args) noexcept {
     try {
         Dispatch dispatch;
-        require(bool(dispatch), VA_STATUS_ERROR_HW_BUSY);
         auto* d = static_cast<Driver*>(ctx->pDriverData);
         require(d, VA_STATUS_ERROR_INVALID_DISPLAY);
+        require(dispatch.for_driver(*d), VA_STATUS_ERROR_HW_BUSY);
         return (d->*Method)(args...);
     } catch (const Status& status) {
         return status.code;
     } catch (const std::bad_alloc&) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    } catch (const EncodingFailure& e) {
+        if (ctx->error_callback) ctx->error_callback(ctx, e.what());
+        return VA_STATUS_ERROR_ENCODING_ERROR;
+    } catch (const std::invalid_argument& e) {
+        if (ctx->error_callback) ctx->error_callback(ctx, e.what());
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
     } catch (const std::exception& e) {
         if (ctx->error_callback) ctx->error_callback(ctx, e.what());
         return VA_STATUS_ERROR_DECODING_ERROR;
@@ -762,7 +1032,7 @@ VAStatus hook(VADriverContextP ctx, Args... args) noexcept {
 VAStatus terminate(VADriverContextP ctx) {
     auto* driver = static_cast<Driver*>(std::exchange(ctx->pDriverData, nullptr));
     Dispatch dispatch;
-    if (dispatch) delete driver;
+    if (!driver || dispatch.for_driver(*driver)) delete driver;
     else {
         // libva tears down the vtable even if termination reports an error.
         // Finish on the owning context without retaining the VA display.
@@ -797,17 +1067,20 @@ extern "C" __attribute__((visibility("default"))) VAStatus VA_INIT_NAME(VA_MAJOR
     if (display != VA_DISPLAY_DRM && display != VA_DISPLAY_WAYLAND && display != VA_DISPLAY_X11) {
         return VA_STATUS_ERROR_INVALID_DISPLAY;
     }
-    try { ctx->pDriverData = new Driver; }
+    Driver* driver;
+    try { ctx->pDriverData = driver = new Driver; }
     catch (const std::bad_alloc&) { return VA_STATUS_ERROR_ALLOCATION_FAILED; }
     ctx->version_major = VA_MAJOR_VERSION;
     ctx->version_minor = VA_MINOR_VERSION;
     ctx->max_profiles = std::size(profiles);
-    ctx->max_entrypoints = 1;
-    ctx->max_attributes = 4;
-    ctx->max_image_formats = 1;
+    const bool encoding = std::any_of(driver->rates.begin(), driver->rates.end(), [](unsigned r) { return r != 0; });
+    ctx->max_entrypoints = encoding ? 2 : 1;
+    ctx->max_attributes = max_config_attributes;
+    ctx->max_image_formats = std::size(image_formats);
     ctx->max_subpic_formats = 1; // libva needs nonzero storage even for an empty query
     ctx->max_display_attributes = 1;
-    ctx->str_vendor = "Codec2 MediaTek MT6989 (AVC/HEVC decode)";
+    ctx->str_vendor = encoding ? "Codec2 MediaTek MT6989 (AVC/HEVC decode, V4L2 encode)" :
+        "Codec2 MediaTek MT6989 (AVC/HEVC decode)";
     auto& v = *ctx->vtable;
     v.vaTerminate = terminate;
     v.vaQueryConfigProfiles = hook<&Driver::query_profiles>;
@@ -826,6 +1099,9 @@ extern "C" __attribute__((visibility("default"))) VAStatus VA_INIT_NAME(VA_MAJOR
     v.vaBufferSetNumElements = hook<&Driver::set_elements>;
     v.vaBufferInfo = hook<&Driver::buffer_info>;
     v.vaMapBuffer = hook<&Driver::map_buffer>;
+#if VA_CHECK_VERSION(1, 21, 0)
+    v.vaMapBuffer2 = hook<&Driver::map_buffer_access>;
+#endif
     v.vaUnmapBuffer = hook<&Driver::unmap_buffer>;
     v.vaDestroyBuffer = hook<&Driver::destroy_buffer>;
     v.vaBeginPicture = hook<&Driver::begin>;
@@ -833,17 +1109,18 @@ extern "C" __attribute__((visibility("default"))) VAStatus VA_INIT_NAME(VA_MAJOR
     v.vaEndPicture = hook<&Driver::end>;
     v.vaSyncSurface = hook<&Driver::sync>;
     v.vaSyncSurface2 = hook<&Driver::sync_timed>;
+    v.vaSyncBuffer = hook<&Driver::sync_buffer>;
     v.vaQuerySurfaceStatus = hook<&Driver::query_surface>;
     v.vaExportSurfaceHandle = hook<&Driver::export_surface>;
     v.vaQuerySurfaceError = unsupported;
     v.vaPutSurface = unsupported;
     v.vaQueryImageFormats = hook<&Driver::query_image_formats>;
     v.vaCreateImage = hook<&Driver::create_image>;
-    v.vaDeriveImage = unsupported;
+    v.vaDeriveImage = hook<&Driver::derive_image>;
     v.vaDestroyImage = hook<&Driver::destroy_image>;
     v.vaSetImagePalette = unsupported;
     v.vaGetImage = hook<&Driver::get_image>;
-    v.vaPutImage = unsupported;
+    v.vaPutImage = hook<&Driver::put_image>;
     v.vaQuerySubpictureFormats = empty_subpictures;
     v.vaCreateSubpicture = unsupported;
     v.vaDestroySubpicture = unsupported;

@@ -35,6 +35,7 @@ va = dependency('libva', version: '>=1.16', required: false)
 drm = dependency('libdrm', required: false)
 if va.found() and drm.found()
   shared_module('codec2_drv_video', 'src/va_driver.cpp', 'src/va_h264.cpp', 'src/va_hevc.cpp',
+    'src/va_encode.cpp', 'src/va_encode_pixels.cpp', 'src/v4l2_encoder.cpp',
     dependencies: [c2_dep, va, drm], name_prefix: '', gnu_symbol_visibility: 'hidden',
     link_args: ['-Wl,-z,nodelete', '-Wl,--exclude-libs,ALL'])
   executable('c2-prime-test', 'tests/mtk-prime.cpp', dependencies: [c2_dep, va, drm, av])
